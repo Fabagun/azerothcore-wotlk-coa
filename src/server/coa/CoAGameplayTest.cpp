@@ -8,6 +8,8 @@
 #include "AscensionCoATalentState.h"
 #include "AscensionSpecialization.h"
 #include "AscensionWisdomball.h"
+#include "AscensionWildcard.h"
+#include "AscensionWildcardStarterData.h"
 #include "AsyncCallbackProcessor.h"
 #include "Bag.h"
 #include "CharacterCache.h"
@@ -573,9 +575,10 @@ void ObserveUnitValues(Actor& actor, WorldPacket const& packet)
 void ObserveExtensionPacket(Actor& actor, WorldPacket const& packet)
 {
     constexpr uint16 FirstExtensionOpcode = 0x520;
-    constexpr std::size_t MaxPayloadsPerOpcode = 64;
+    constexpr std::size_t MaxPayloadsPerOpcode = 256;
     if (packet.GetOpcode() < FirstExtensionOpcode && packet.GetOpcode() != SMSG_MOVE_SET_CAN_FLY &&
-        packet.GetOpcode() != SMSG_MOVE_UNSET_CAN_FLY)
+        packet.GetOpcode() != SMSG_MOVE_UNSET_CAN_FLY && packet.GetOpcode() != SMSG_CONVERT_RUNE &&
+        packet.GetOpcode() != SMSG_ADD_RUNE_POWER)
         return;
 
     ++actor.extensionPackets[packet.GetOpcode()];
@@ -1362,6 +1365,48 @@ private:
         return nullptr;
     }
 
+    static AscensionWildcard::Slot WildcardSlot(Player const* player, uint32 slot)
+    {
+        std::vector<AscensionWildcard::Slot> const slots = AscensionWildcard::Slots(player);
+        Require(slot < slots.size() && slots[slot].EntryId, "The actor has no Wildcard entry in that slot");
+        return slots[slot];
+    }
+
+    static uint32 WildcardSpell(AscensionWildcard::Slot const& slot)
+    {
+        auto const& entries = AscensionWildcard::LoadedTables().Entries;
+        auto const entry = std::find_if(entries.begin(), entries.end(),
+            [&slot](AscensionWildcard::Entry const& candidate) { return candidate.EntryId == slot.EntryId; });
+        return entry != entries.end() && slot.Rank <= entry->RankSpells.size() ? entry->RankSpells[slot.Rank - 1] : 0;
+    }
+
+    static uint32 LowestCollectedCard(Player const* player, uint32 type)
+    {
+        auto const& tables = AscensionWildcard::LoadedTables();
+        std::vector<AscensionWildcard::Slot> const slots = AscensionWildcard::Slots(player);
+        AscensionWildcard::CardCollection const collection = AscensionWildcard::Collection(player);
+        uint32 lowest = 0;
+        uint32 lowestLevel = std::numeric_limits<uint32>::max();
+        for (uint32 card : collection.Collected)
+        {
+            auto const info = tables.Cards.find(card);
+            if (info == tables.Cards.end() || info->second.Type != type)
+                continue;
+            uint32 const entryId = info->second.EntryId;
+            auto const entry = std::find_if(tables.Entries.begin(), tables.Entries.end(),
+                [entryId](AscensionWildcard::Entry const& candidate) { return candidate.EntryId == entryId; });
+            bool const known = std::any_of(slots.begin(), slots.end(),
+                [entryId](AscensionWildcard::Slot const& slot) { return slot.EntryId == entryId; });
+            if (entry == tables.Entries.end() || known || entry->MinLevel > lowestLevel ||
+                (entry->MinLevel == lowestLevel && card > lowest))
+                continue;
+            lowest = card;
+            lowestLevel = entry->MinLevel;
+        }
+        Require(lowest != 0, "The actor has collected no usable skill card of that type");
+        return lowest;
+    }
+
     static std::string BuybackGuid(Player* player, uint32 entry)
     {
         for (uint32 slot = BUYBACK_SLOT_START; slot < BUYBACK_SLOT_END; ++slot)
@@ -1478,7 +1523,9 @@ private:
                 creature->CombatStop(true, true);
                 if (CreatureAI* ai = creature->AI(); ai && ai->IsEngaged())
                     ai->EnterEvadeMode();
-                creature->SetReactState(REACT_PASSIVE);
+                uint32 const reaction = definition.get<uint32>("reaction", REACT_PASSIVE);
+                Require(reaction <= REACT_AGGRESSIVE, "Fixture reaction outside valid range");
+                creature->SetReactState(ReactStates(reaction));
             }
         }
         _targetsCreated = true;
@@ -1489,6 +1536,8 @@ private:
         Unit* unit = GetUnit(step.get<std::string>("actor"));
         std::string metric = step.get<std::string>("metric");
         uint32 spell = step.get<uint32>("spell", 0);
+        if (metric == "victim")
+            return unit->GetVictim() == GetUnit(step.get<std::string>("target")) ? 1.0 : 0.0;
         if (metric == "player_name")
             return unit->GetName() == step.get<std::string>("name") ? 1.0 : 0.0;
         if (metric == "name_lookup")
@@ -1523,6 +1572,12 @@ private:
             Require(power < MAX_POWERS, "Invalid power index");
             return metric == "power" || metric == "pet_power" ?
                 unit->GetPower(Powers(power)) : unit->GetMaxPower(Powers(power));
+        }
+        if (metric == "respawn_remaining")
+        {
+            Creature* creature = unit->ToCreature();
+            Require(creature != nullptr, "Respawn metric needs a creature");
+            return std::max<time_t>(0, creature->GetRespawnTime() - GameTime::GetGameTime().count());
         }
         if (metric == "alive")
             return unit->IsAlive();
@@ -1761,6 +1816,15 @@ private:
             uint8 button = uint8(step.get<uint32>("button"));
             ActionButton const* action = player->GetActionButton(button);
             return action && action->GetType() == ACTION_BUTTON_SPELL ? action->GetAction() : 0;
+        }
+        if (metric == "action_bar_unknown_spells")
+        {
+            uint32 unknown = 0;
+            for (uint8 button = 0; button < MAX_ACTION_BUTTONS; ++button)
+                if (ActionButton const* action = player->GetActionButton(button);
+                    action && action->GetType() == ACTION_BUTTON_SPELL && !player->HasSpell(action->GetAction()))
+                    ++unknown;
+            return unknown;
         }
         if (metric == "temporary_spell_replacement")
             return player->GetTemporarySpellReplacement(spell);
@@ -2432,7 +2496,8 @@ private:
         if (metric == "pet_entry" || metric == "pet_aura_stacks" || metric == "pet_aura_amount" ||
             metric == "pet_aura_amplitude_ms" || metric == "pet_aura_duration_ms" || metric == "pet_max_health" ||
             metric == "pet_attack_power" || metric == "pet_run_speed_rate" || metric == "pet_is_banker" ||
-            metric == "pet_display" || metric == "pet_scale" || metric == "pet_knows_spell")
+            metric == "pet_display" || metric == "pet_scale" || metric == "pet_knows_spell" ||
+            metric == "pet_distance")
         {
             Creature* pet = player->GetGuardianPet();
             if (!pet)
@@ -2453,6 +2518,8 @@ private:
                 metric == "pet_aura_amplitude_ms" || metric == "pet_aura_duration_ms"))
                 return 0;
             Require(pet != nullptr, "Metric needs a current pet");
+            if (metric == "pet_distance")
+                return player->GetExactDist2d(pet);
             if (metric == "pet_max_health")
                 return pet->GetMaxHealth();
             if (metric == "pet_attack_power")
@@ -2628,6 +2695,14 @@ private:
         }
         if (metric == "free_inventory_slots")
             return double(player->GetFreeInventorySpace());
+        if (metric == "has_achievement")
+            return player->HasAchieved(step.get<uint32>("achievement")) ? 1.0 : 0.0;
+        if (metric == "has_title")
+        {
+            CharTitlesEntry const* title = sCharTitlesStore.LookupEntry(step.get<uint32>("title"));
+            Require(title != nullptr, "has_title needs a title from CharTitles.dbc");
+            return player->HasTitle(title) ? 1.0 : 0.0;
+        }
         if (metric == "mail_count" || metric == "mail_item_count" || metric == "mail_has_item")
         {
             uint32 mails = 0, items = 0;
@@ -2784,6 +2859,34 @@ private:
             uint32 const index = step.get<uint32>("index");
             return values && index < values->size() ? double((*values)[index].value) : 0.0;
         }
+        if (metric == "wildcard_starter_spells_known")
+        {
+            auto const& starters = AscensionWildcardStarterData::OtherAbilities;
+            return double(std::count_if(starters.begin(), starters.end(),
+                [player](auto const& starter) { return player->HasSpell(starter.SpellId); }));
+        }
+        if (metric == "wildcard_spells_known")
+        {
+            std::vector<AscensionWildcard::Slot> const slots = AscensionWildcard::Slots(player);
+            return double(std::count_if(slots.begin(), slots.end(), [player](AscensionWildcard::Slot const& slot)
+            {
+                uint32 const spellId = slot.EntryId ? WildcardSpell(slot) : 0;
+                return spellId && player->HasSpell(spellId);
+            }));
+        }
+        if (metric == "wildcard_cards_pending")
+            return double(AscensionWildcard::Collection(player).Pending.size());
+        if (metric == "wildcard_cards_collected")
+            return double(AscensionWildcard::Collection(player).Collected.size());
+        if (metric == "wildcard_bonus_pack_progress")
+            return double(AscensionWildcard::Collection(player).BonusProgress);
+        if (metric == "wildcard_roll_cards_set" || metric == "wildcard_roll_cards_used")
+        {
+            AscensionWildcard::RollCardSlots const cards = AscensionWildcard::RollCards(player);
+            bool const used = metric == "wildcard_roll_cards_used";
+            return double(std::count_if(cards.begin(), cards.end(), [used](AscensionWildcard::CardSlot const& slot)
+                { return slot.Card && (!used || slot.Used); }));
+        }
         if (metric == "player_class")
             return player->getClass();
         if (metric == "cached_class")
@@ -2851,6 +2954,19 @@ private:
                             request << StabledPetNumber(player, value.get_value<uint32>());
                         else if (kind == "actor_guid")
                             request << GetUnit(value.get_value<std::string>())->GetGUID().GetRawValue();
+                        else if (kind == "wildcard_entry")
+                            request << WildcardSlot(player, value.get_value<uint32>()).EntryId;
+                        else if (kind == "wildcard_lowest_card")
+                            request << LowestCollectedCard(player, value.get_value<uint32>());
+                        else if (kind == "wildcard_pending_cards")
+                        {
+                            std::vector<AscensionWildcard::PendingCard> cards =
+                                AscensionWildcard::Collection(player).Pending;
+                            cards.resize(std::min<std::size_t>(cards.size(), value.get_value<uint32>()));
+                            request << uint32(cards.size());
+                            for (AscensionWildcard::PendingCard const& pending : cards)
+                                request << AscensionWildcard::PendingCardName(pending.Id) << pending.Card << uint32(1);
+                        }
                         else
                             throw std::runtime_error("Unknown packet field type: " + kind);
                     }
@@ -3122,6 +3238,13 @@ private:
             player->GetSession()->HandleLfgTeleportOpcode(packet);
             record.put("result", "teleport requested");
         }
+        else if (action == "encounter_credit")
+        {
+            Map* map = player->GetMap();
+            Require(map != nullptr && map->IsDungeon(), "Encounter credit needs a dungeon map");
+            map->UpdateEncounterState(ENCOUNTER_CREDIT_KILL_CREATURE, step.get<uint32>("entry"), nullptr);
+            record.put("result", "encounter credited");
+        }
         else if (action == "leave_group")
         {
             Require(player->GetGroup() != nullptr, "Leave request needs a group");
@@ -3234,6 +3357,12 @@ private:
                     Require(!creatures.front()->IsAlive(),
                         "Killing blow did not kill, health left " + std::to_string(creatures.front()->GetHealth()));
                 }
+                else if (auto damagePct = step.get_optional<int32>("damage_pct"))
+                {
+                    Require(*damagePct > 0 && *damagePct < 100, "Damage share outside (0, 100)");
+                    Unit::DealDamage(player, creatures.front(), creatures.front()->CountPctFromMaxHealth(*damagePct),
+                        nullptr, DIRECT_DAMAGE, SPELL_SCHOOL_MASK_NORMAL);
+                }
                 else
                     player->GetSession()->HandleAttackSwingOpcode(packet);
             }
@@ -3255,8 +3384,24 @@ private:
         }
         else if (action == "loot_slot")
         {
+            uint32 slot = step.get<uint32>("slot", 0);
+            if (auto entry = step.get_optional<uint32>("item"))
+            {
+                Creature* creature = player->GetMap()->GetCreature(player->GetLootGUID());
+                Require(creature != nullptr, "Item-selected loot needs an open creature corpse");
+                Loot& loot = creature->loot;
+                slot = loot.GetMaxSlotInLootFor(player);
+                for (uint32 candidate = 0; candidate < loot.GetMaxSlotInLootFor(player); ++candidate)
+                    if (LootItem* item = loot.LootItemInSlot(candidate, player))
+                        if (item->itemid == *entry)
+                        {
+                            slot = candidate;
+                            break;
+                        }
+                Require(slot < loot.GetMaxSlotInLootFor(player), "Requested item is not in this player's loot");
+            }
             WorldPacket packet(CMSG_AUTOSTORE_LOOT_ITEM, 1);
-            packet << uint8(step.get<uint32>("slot", 0));
+            packet << uint8(slot);
             if (sScriptMgr->CanPacketReceive(player->GetSession(), packet))
                 player->GetSession()->HandleAutostoreLootItemOpcode(packet);
         }
@@ -3478,7 +3623,9 @@ private:
         else if (action == "set_action_button")
         {
             uint8 button = uint8(step.get<uint32>("button"));
-            Require(player->addActionButton(button, spell, ACTION_BUTTON_SPELL) != nullptr,
+            uint32 const barSpell = step.get_optional<uint32>("wildcard_slot")
+                ? WildcardSpell(WildcardSlot(player, step.get<uint32>("wildcard_slot"))) : spell;
+            Require(player->addActionButton(button, barSpell, ACTION_BUTTON_SPELL) != nullptr,
                 "Action button could not be set");
         }
         else if (action == "learn")

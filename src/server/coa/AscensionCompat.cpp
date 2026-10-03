@@ -23,6 +23,7 @@
 #include "AscensionCoAConfig.h"
 #include "WorldSessionMgr.h"
 #include "AscensionCoATalentState.h"
+#include "AscensionWildcard.h"
 #include "AscensionRunemasterEchoes.h"
 #include "AscensionCollectionModelData.h"
 #include "AscensionAmmunitionData.h"
@@ -70,6 +71,7 @@
 #include "GameTime.h"
 #include "GossipDef.h"
 #include "GlobalScript.h"
+#include "GroupScript.h"
 #include "GridTerrainData.h"
 #include "GuildPackets.h"
 #include "Item.h"
@@ -92,6 +94,7 @@
 #include "StringConvert.h"
 #include "Timer.h"
 #include "Tokenize.h"
+#include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
 
@@ -113,6 +116,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -130,6 +134,8 @@ constexpr uint16 CMSG_CUSTOM_ASCENSION_POINT_SPEND_REQUEST = 0x0523;
 constexpr uint16 CMSG_EXTENSION_INITIALIZED = 0x0561;
 constexpr uint16 CMSG_CREATURE_QUERY_BULK = 0x061A;
 constexpr uint16 CMSG_ITEM_QUERY_BULK = 0x061B;
+constexpr uint16 SMSG_PATCH_APPEARANCES = 0x0692;
+constexpr uint16 SMSG_PATCH_ITEM_APPEARANCES = 0x0693;
 constexpr uint16 CMSG_APPLY_APPEARANCES = 0x0697;
 constexpr uint16 SMSG_APPLY_APPEARANCES_RESULT = 0x0698;
 constexpr uint16 SMSG_APPEARANCE_COLLECTION_INFO = 0x0699;
@@ -159,6 +165,14 @@ constexpr uint16 SMSG_CHARACTER_ADVANCEMENT_UPDATE_ENTRIES_RESULT = 0x072C;
 constexpr uint16 CMSG_INSPECT_CHARACTER_ADVANCEMENT = 0x06E1;
 constexpr uint16 SMSG_INSPECT_CHARACTER_ADVANCEMENT_RESULT = 0x06E2;
 constexpr uint16 CMSG_MISSILE_FIRE_POSITION = 0x09C7;
+
+constexpr uint16 SMSG_PATCH_LOADING_SCREENS = 0x05F8;
+constexpr uint16 SMSG_PATCH_CREATURE_DISPLAY_INFO = 0x0976;
+constexpr uint16 SMSG_PATCH_ITEM = 0x0932;
+constexpr uint16 SMSG_PATCH_ITEM_DISPLAY_INFO = 0x096B;
+constexpr uint16 SMSG_PATCH_SPELL = 0x092A;
+constexpr uint32 CUSTOM_DISPLAY_ID_FALLBACK_MIN = 652000;
+constexpr uint32 DISPLAY_PATCH_FALLBACK_DELAY_MS = 5000;
 
 constexpr uint16 SMSG_PATCH_VANITY_COLLECTION = 0x0573;
 constexpr uint16 SMSG_UPDATE_OBJECT_ADDON = 0x0578;
@@ -210,6 +224,8 @@ constexpr ExtensionOpcodeIdentity EXTENSION_OPCODES[] = {
     {0x05A1, "CMSG_CHALLENGE_QUERY_FAILURE"},
     {CMSG_ITEM_QUERY_BULK, "CMSG_ITEM_QUERY_BULK"},
     {0x0667, "CMSG_SET_LEVEL_SCALING"},
+    {SMSG_PATCH_APPEARANCES, "SMSG_PATCH_APPEARANCES"},
+    {SMSG_PATCH_ITEM_APPEARANCES, "SMSG_PATCH_ITEM_APPEARANCES"},
     {CMSG_APPLY_APPEARANCES, "CMSG_APPLY_APPEARANCES"},
     {SMSG_APPLY_APPEARANCES_RESULT, "SMSG_APPLY_APPEARANCES_RESULT"},
     {SMSG_APPEARANCE_COLLECTION_INFO, "SMSG_APPEARANCE_COLLECTION_INFO"},
@@ -382,6 +398,8 @@ enum class AscensionCompatConfig {
   GAME_MODE_MASK,
   CLIENT_BOOLEAN_CONFIGS,
   CLIENT_INTEGER_CONFIGS,
+  SEND_DISPLAY_PATCHES,
+  CLIENT_DBC_DIRECTORY,
 
   NUM_CONFIGS,
 };
@@ -428,6 +446,10 @@ public:
                          "CoA.QuestLevelScaling", true);
     SetConfigValue<bool>(AscensionCompatConfig::AUTO_PROGRESSION,
                          "CoA.AutoProgression", false);
+    SetConfigValue<bool>(AscensionCompatConfig::SEND_DISPLAY_PATCHES,
+                         "CoA.SendDisplayPatches", true);
+    SetConfigValue<std::string>(AscensionCompatConfig::CLIENT_DBC_DIRECTORY,
+                                "CoA.ClientDbcDirectory", "");
   }
 };
 
@@ -600,16 +622,12 @@ constexpr std::array<FelswornRiftGrant, 3> FelswornHordeCapitalRifts =
     {535600, 36}
 }};
 
-constexpr std::array<uint32, 6> FelswornCapitalRifts = {535595, 535596, 535597, 535598, 535599, 535600};
-
 bool CanGrantAscensionRacialSpell(Player const* player, uint32 spellId)
 {
+    if (!AscensionFelsworn::CanLearnRift(player, spellId))
+        return false;
     bool racial = false;
     auto const bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
-    if (std::find(FelswornCapitalRifts.begin(), FelswornCapitalRifts.end(), spellId) != FelswornCapitalRifts.end())
-        for (auto itr = bounds.first; itr != bounds.second; ++itr)
-            if (itr->second->RaceMask && !(itr->second->RaceMask & player->getRaceMask()))
-                return false;
     for (auto itr = bounds.first; itr != bounds.second; ++itr)
         if (AscensionRacialAbilities::GetRace(itr->second->SkillLine))
         {
@@ -1371,6 +1389,8 @@ public:
 
   static std::vector<AscensionCoATalentState::KnownEntry> KnownTalentEntries(Player const* player)
   {
+    if (AscensionWildcard::IsWildcardHero(player))
+      return AscensionWildcard::KnownEntries(player);
     return AscensionCoATalentState::KnownEntries(player->getClass(), SpellbookOf(player));
   }
 
@@ -1395,10 +1415,14 @@ public:
   void SendCharacterAdvancementState(Player* player)
   {
     WorldPacket packet(SMSG_CHARACTER_ADVANCEMENT_ACTIVE_SPEC, sizeof(uint32) * 2);
-    packet << uint32(0) << uint32(1);
+    bool const wildcard = AscensionWildcard::IsWildcardHero(player);
+    packet << (wildcard ? AscensionWildcard::ActiveSpec(player) : uint32(0))
+           << uint32(wildcard ? AscensionWildcard::SPECIALIZATION_COUNT : 1);
     player->GetSession()->SendPacket(&packet);
 
     uint32 const sent = SendKnownTalentEntries(player);
+    if (wildcard)
+      AscensionWildcard::SignalRollReady(player);
     LOG_INFO("coa",
              "Initialized Character Advancement for {} (class {}, level {}) with {} known entries",
              player->GetName(), uint32(player->getClass()), uint32(player->GetLevel()), sent);
@@ -1422,7 +1446,7 @@ public:
       result = "CA_INSPECT_TARGET_NOT_FOUND";
     else if (!target->IsInWorld())
       result = "CA_INSPECT_NOT_IN_WORLD";
-    else if (!player->IsWithinDistInMap(target, INSPECT_DISTANCE))
+    else if (!player->IsWithinDistInMap(target, std::max(INSPECT_DISTANCE, player->GetVisibilityRange())))
       result = "CA_INSPECT_TARGET_NOT_IN_RANGE";
 
     WorldPacket packet(SMSG_INSPECT_CHARACTER_ADVANCEMENT_RESULT, 64);
@@ -1759,7 +1783,7 @@ public:
       _pendingTalentRequests.erase(itr);
     }
 
-    if (!IsAscensionCustomClass(player))
+    if (!IsAscensionCustomClass(player) && !AscensionWildcard::IsWildcardHero(player))
       return;
     for (TalentRequest const& request : requests)
     {
@@ -1784,6 +1808,12 @@ public:
       refusal.Result = "CA_UPDATE_ENTRIES_UNKNOWN";
       LOG_WARN("coa", "Malformed Ascension known-entries upload from {} payload={} bytes",
                player->GetName(), body.size());
+    }
+    else if (AscensionWildcard::IsWildcardHero(player))
+    {
+      AscensionWildcard::BuildChoice const choice = AscensionWildcard::ApplyBuildUpload(player, upload);
+      refusal.Result = choice.Result;
+      refusal.Learn = choice.Learn;
     }
     else if (!ApplyKnownEntriesUpload(player, upload, refusal))
     {
@@ -3105,6 +3135,489 @@ private:
 
 bool SendCollectionCreatureQueryResponse(WorldSession* session, uint32 creatureId);
 
+class AscensionDisplayPatchService {
+public:
+  static AscensionDisplayPatchService &Instance() {
+    static AscensionDisplayPatchService instance;
+    return instance;
+  }
+
+  void Initialize() {
+    if (!ascensionCompatConfig.GetConfigValue<bool>(
+            AscensionCompatConfig::SEND_DISPLAY_PATCHES))
+      return;
+
+    PreparedPatchRows const &rows = GetPreparedPatchRows();
+    LOG_INFO("coa",
+             "Prepared {} CreatureDisplayInfo, {} ItemDisplayInfo, {} Item and "
+             "{} Spell patch rows for the client stream",
+             rows.CreatureDisplayIds.size(), rows.ItemDisplayInfos.size(),
+             rows.Items.size(), rows.Spells.size());
+  }
+
+  void OnPlayerLogin(Player *player) {
+    if (!ascensionCompatConfig.GetConfigValue<bool>(
+            AscensionCompatConfig::SEND_DISPLAY_PATCHES))
+      return;
+
+    uint32 const guid = player->GetGUID().GetCounter();
+    std::lock_guard lock(_mutex);
+    _streamedPlayers.erase(guid);
+    _fallbackTimers[guid] = DISPLAY_PATCH_FALLBACK_DELAY_MS;
+  }
+
+  void OnPlayerLogout(Player *player) {
+    uint32 const guid = player->GetGUID().GetCounter();
+    std::lock_guard lock(_mutex);
+    _streamedPlayers.erase(guid);
+    _fallbackTimers.erase(guid);
+  }
+
+  void OnPlayerUpdate(Player *player, uint32 diff) {
+    if (!ascensionCompatConfig.GetConfigValue<bool>(
+            AscensionCompatConfig::SEND_DISPLAY_PATCHES))
+      return;
+
+    uint32 const guid = player->GetGUID().GetCounter();
+    bool expired = false;
+    {
+      std::lock_guard lock(_mutex);
+      auto const itr = _fallbackTimers.find(guid);
+      if (itr != _fallbackTimers.end())
+      {
+        if (itr->second > diff)
+          itr->second -= diff;
+        else
+        {
+          _fallbackTimers.erase(itr);
+          expired = true;
+        }
+      }
+    }
+
+    if (expired)
+      SendPatchStream(player);
+  }
+
+  void SendPatchStream(Player *player) {
+    if (!ascensionCompatConfig.GetConfigValue<bool>(
+            AscensionCompatConfig::SEND_DISPLAY_PATCHES))
+      return;
+
+    uint32 const guid = player->GetGUID().GetCounter();
+    {
+      std::lock_guard lock(_mutex);
+      if (!_streamedPlayers.insert(guid).second)
+        return;
+      _fallbackTimers.erase(guid);
+    }
+
+    uint32 const startTime = getMSTime();
+    PreparedPatchRows const &rows = GetPreparedPatchRows();
+
+    SendLoadingScreenRow(player);
+
+    uint32 sent = 0;
+    for (uint32 displayId : rows.CreatureDisplayIds) {
+      if (CreatureDisplayInfoEntry const *entry =
+              sCreatureDisplayInfoStore.LookupEntry(displayId)) {
+        SendDisplayInfoRow(player, *entry);
+        ++sent;
+      }
+    }
+
+    for (ItemDisplayInfoPatchRow const &row : rows.ItemDisplayInfos)
+      SendItemDisplayInfoRow(player, row);
+
+    for (ItemPatchRow const &row : rows.Items)
+      SendItemRow(player, row);
+
+    for (SpellPatchRow const &row : rows.Spells)
+      SendSpellRow(player, row);
+
+    LOG_INFO("coa",
+             "Streamed {} CreatureDisplayInfo, {} ItemDisplayInfo, {} Item and "
+             "{} Spell patch rows to {} in {} ms",
+             sent, rows.ItemDisplayInfos.size(), rows.Items.size(),
+             rows.Spells.size(), player->GetName(),
+             GetMSTimeDiffToNow(startTime));
+  }
+
+private:
+  static constexpr std::size_t ITEM_DISPLAY_INFO_FIELD_COUNT = 25;
+  static constexpr std::array<uint8, 14> ITEM_DISPLAY_INFO_STRING_FIELDS = {
+      1, 2, 3, 4, 5, 6, 15, 16, 17, 18, 19, 20, 21, 22};
+
+  struct ItemDisplayInfoPatchRow {
+    std::array<uint32, ITEM_DISPLAY_INFO_FIELD_COUNT> Values{};
+    std::array<std::string, ITEM_DISPLAY_INFO_STRING_FIELDS.size()> Strings;
+  };
+
+  using ItemPatchRow = std::array<uint32, 8>;
+
+  static constexpr uint32 SPELL_DBC_FIELD_COUNT = 234;
+  static constexpr uint32 SPELL_CLIENT_RECORD_DWORDS = 170;
+  static constexpr uint32 LOCALIZED_STRING_DWORDS = 17;
+  static constexpr uint32 SPELL_NAME_FIELD = 136;
+  static constexpr uint32 SPELL_RANK_FIELD = 153;
+  static constexpr uint32 SPELL_DESCRIPTION_FIELD = 170;
+  static constexpr uint32 SPELL_TOOLTIP_FIELD = 187;
+  static constexpr std::array<uint32, 4> SPELL_WIRE_STRING_FIELDS = {
+      SPELL_NAME_FIELD, SPELL_DESCRIPTION_FIELD, SPELL_RANK_FIELD,
+      SPELL_TOOLTIP_FIELD};
+  static constexpr std::size_t SPELL_WIRE_DESCRIPTION = 1;
+
+  struct SpellPatchRow {
+    std::array<uint32, SPELL_CLIENT_RECORD_DWORDS> Values{};
+    std::array<std::string, SPELL_WIRE_STRING_FIELDS.size()> Strings;
+  };
+
+  struct PreparedPatchRows {
+    std::vector<uint32> CreatureDisplayIds;
+    std::vector<ItemDisplayInfoPatchRow> ItemDisplayInfos;
+    std::vector<ItemPatchRow> Items;
+    std::vector<SpellPatchRow> Spells;
+  };
+
+  static void AppendSizedString(WorldPacket &packet, std::string const &text) {
+    packet << uint32(text.size());
+    if (!text.empty())
+      packet.append(reinterpret_cast<uint8 const *>(text.data()), text.size());
+  }
+
+  void SendLoadingScreenRow(Player *player) const {
+    WorldPacket packet(SMSG_PATCH_LOADING_SCREENS, 24);
+    uint8 loadingScreenRow[16] = {};
+    packet.append(loadingScreenRow, sizeof(loadingScreenRow));
+    packet << uint32(0) << uint32(0);
+    player->GetSession()->SendPacket(&packet);
+  }
+
+  void SendDisplayInfoRow(Player *player,
+                          CreatureDisplayInfoEntry const &entry) const {
+    WorldPacket packet(SMSG_PATCH_CREATURE_DISPLAY_INFO, 80);
+
+    uint32 const soundId = 0;
+    uint8 displayRow[64] = {};
+    std::memcpy(displayRow + 0x00, &entry.Displayid, sizeof(uint32));
+    std::memcpy(displayRow + 0x04, &entry.ModelId, sizeof(uint32));
+    std::memcpy(displayRow + 0x08, &soundId, sizeof(uint32));
+    std::memcpy(displayRow + 0x0C, &entry.ExtendedDisplayInfoID, sizeof(uint32));
+    std::memcpy(displayRow + 0x10, &entry.scale, sizeof(float));
+    displayRow[0x14] = 255;
+
+    packet.append(displayRow, sizeof(displayRow));
+    for (uint8 stringIndex = 0; stringIndex < 4; ++stringIndex)
+      packet << uint32(0);
+
+    player->GetSession()->SendPacket(&packet);
+  }
+
+  void SendItemDisplayInfoRow(Player *player,
+                              ItemDisplayInfoPatchRow const &row) const {
+    WorldPacket packet(SMSG_PATCH_ITEM_DISPLAY_INFO, 160);
+    for (uint32 value : row.Values)
+      packet << value;
+    for (std::string const &text : row.Strings)
+      AppendSizedString(packet, text);
+    player->GetSession()->SendPacket(&packet);
+  }
+
+  void SendItemRow(Player *player, ItemPatchRow const &row) const {
+    WorldPacket packet(SMSG_PATCH_ITEM, row.size() * sizeof(uint32));
+    for (uint32 value : row)
+      packet << value;
+    player->GetSession()->SendPacket(&packet);
+  }
+
+  void SendSpellRow(Player *player, SpellPatchRow const &row) const {
+    WorldPacket packet(SMSG_PATCH_SPELL,
+                       row.Values.size() * sizeof(uint32) + 1024);
+    for (uint32 value : row.Values)
+      packet << value;
+    for (std::string const &text : row.Strings)
+      AppendSizedString(packet, text);
+    player->GetSession()->SendPacket(&packet);
+  }
+
+  PreparedPatchRows const &GetPreparedPatchRows() {
+    std::lock_guard lock(_cacheMutex);
+    if (!_rowsPrepared)
+    {
+      std::filesystem::path const clientDbcDirectory =
+          ResolveClientDbcDirectory();
+      _rows.CreatureDisplayIds = BuildDisplayPatchRows(clientDbcDirectory);
+      _rows.ItemDisplayInfos =
+          BuildItemDisplayInfoPatchRows(clientDbcDirectory);
+      _rows.Items = BuildItemPatchRows(clientDbcDirectory);
+      _rows.Spells = BuildSpellPatchRows();
+      _rowsPrepared = true;
+    }
+    return _rows;
+  }
+
+  static std::filesystem::path ResolveClientDbcDirectory() {
+    std::string const configuredDirectory(
+        ascensionCompatConfig.GetConfigValue<std::string>(
+            AscensionCompatConfig::CLIENT_DBC_DIRECTORY));
+    if (!configuredDirectory.empty())
+      return configuredDirectory;
+    return std::filesystem::path(sWorld->GetDataPath()) / "dbc_clientset";
+  }
+
+  static std::optional<std::unordered_set<uint32>>
+  LoadDbcIds(std::filesystem::path const &path, uint32 minimumDWords) {
+    ClientDBC file;
+    if (!file.Load(path.string(), minimumDWords))
+      return std::nullopt;
+
+    std::unordered_set<uint32> ids;
+    ids.reserve(file.GetRecordCount());
+    for (uint32 row = 0; row < file.GetRecordCount(); ++row)
+      ids.insert(file.GetRecord(row).GetUInt32(0));
+    return ids;
+  }
+
+  static bool IsItemDisplayInfoStringField(uint8 field) {
+    return std::ranges::find(ITEM_DISPLAY_INFO_STRING_FIELDS, field) !=
+           ITEM_DISPLAY_INFO_STRING_FIELDS.end();
+  }
+
+  static std::vector<ItemDisplayInfoPatchRow>
+  BuildItemDisplayInfoPatchRows(std::filesystem::path const &clientDbcDirectory) {
+    std::vector<ItemDisplayInfoPatchRow> rows = LoadItemDisplayInfoPatchRows();
+
+    std::filesystem::path const clientDbc =
+        clientDbcDirectory / "ItemDisplayInfo.dbc";
+    std::optional<std::unordered_set<uint32>> const clientIds =
+        LoadDbcIds(clientDbc, ITEM_DISPLAY_INFO_FIELD_COUNT);
+    if (!clientIds)
+    {
+      LOG_WARN("coa",
+               "Client DBC copy {} is unavailable; streaming only the "
+               "itemdisplayinfo_dbc rows",
+               clientDbc.generic_string());
+      return rows;
+    }
+
+    std::unordered_set<uint32> overriddenIds;
+    for (ItemDisplayInfoPatchRow const &row : rows)
+      overriddenIds.insert(row.Values[0]);
+
+    ClientDBC serverDisplays;
+    std::filesystem::path const serverDbc =
+        std::filesystem::path(sWorld->GetDataPath()) / "dbc" /
+        "ItemDisplayInfo.dbc";
+    if (!serverDisplays.Load(serverDbc.string(), ITEM_DISPLAY_INFO_FIELD_COUNT))
+      return rows;
+
+    for (uint32 index = 0; index < serverDisplays.GetRecordCount(); ++index) {
+      ClientDBC::Record const record = serverDisplays.GetRecord(index);
+      uint32 const displayId = record.GetUInt32(0);
+      if (clientIds->contains(displayId) || overriddenIds.contains(displayId))
+        continue;
+
+      ItemDisplayInfoPatchRow &row = rows.emplace_back();
+      std::size_t stringIndex = 0;
+      for (uint8 field = 0; field < ITEM_DISPLAY_INFO_FIELD_COUNT; ++field) {
+        if (IsItemDisplayInfoStringField(field))
+          row.Strings[stringIndex++] = std::string(record.GetString(field));
+        else
+          row.Values[field] = record.GetUInt32(field);
+      }
+    }
+
+    return rows;
+  }
+
+  static std::vector<ItemPatchRow>
+  BuildItemPatchRows(std::filesystem::path const &clientDbcDirectory) {
+    std::vector<ItemPatchRow> rows = LoadItemPatchRows();
+
+    std::filesystem::path const clientDbc = clientDbcDirectory / "Item.dbc";
+    std::optional<std::unordered_set<uint32>> const clientIds =
+        LoadDbcIds(clientDbc, std::tuple_size_v<ItemPatchRow>);
+    if (!clientIds)
+    {
+      LOG_WARN("coa",
+               "Client DBC copy {} is unavailable; streaming only the item_dbc "
+               "rows",
+               clientDbc.generic_string());
+      return rows;
+    }
+
+    std::unordered_set<uint32> overriddenIds;
+    for (ItemPatchRow const &row : rows)
+      overriddenIds.insert(row[0]);
+
+    for (uint32 itemId = 0; itemId < sItemStore.GetNumRows(); ++itemId) {
+      ItemEntry const *entry = sItemStore.LookupEntry(itemId);
+      if (!entry || clientIds->contains(itemId) ||
+          overriddenIds.contains(itemId))
+        continue;
+
+      rows.push_back({entry->ID, entry->ClassID, entry->SubclassID,
+                      static_cast<uint32>(entry->SoundOverrideSubclassID),
+                      static_cast<uint32>(entry->Material),
+                      entry->DisplayInfoID, entry->InventoryType,
+                      entry->SheatheType});
+    }
+
+    return rows;
+  }
+
+  static std::vector<SpellPatchRow> BuildSpellPatchRows() {
+    std::vector<SpellPatchRow> rows;
+    std::unordered_map<uint32, std::string> descriptions =
+        LoadClientSpellDescriptions();
+    if (descriptions.empty())
+      return rows;
+
+    ClientDBC spells;
+    std::filesystem::path const serverDbc =
+        std::filesystem::path(sWorld->GetDataPath()) / "dbc" / "Spell.dbc";
+    if (!spells.Load(serverDbc.string(), SPELL_DBC_FIELD_COUNT))
+      return rows;
+
+    for (uint32 index = 0; index < spells.GetRecordCount(); ++index) {
+      ClientDBC::Record const record = spells.GetRecord(index);
+      auto const description = descriptions.find(record.GetUInt32(0));
+      if (description == descriptions.end())
+        continue;
+
+      SpellPatchRow &row = rows.emplace_back();
+      std::size_t slot = 0;
+      for (uint32 field = 0; field < SPELL_DBC_FIELD_COUNT;) {
+        bool const localized =
+            field >= SPELL_NAME_FIELD && field <= SPELL_TOOLTIP_FIELD;
+        row.Values[slot++] = localized ? 0 : record.GetUInt32(field);
+        field += localized ? LOCALIZED_STRING_DWORDS : 1;
+      }
+      for (std::size_t text = 0; text < SPELL_WIRE_STRING_FIELDS.size(); ++text)
+        row.Strings[text] =
+            std::string(record.GetString(SPELL_WIRE_STRING_FIELDS[text]));
+      row.Strings[SPELL_WIRE_DESCRIPTION] = std::move(description->second);
+      descriptions.erase(description);
+    }
+
+    for (auto const &[spellId, text] : descriptions)
+      LOG_ERROR("coa",
+                "coa_client_spell_description {} has no Spell.dbc record",
+                spellId);
+
+    return rows;
+  }
+
+  static std::unordered_map<uint32, std::string> LoadClientSpellDescriptions() {
+    std::unordered_map<uint32, std::string> descriptions;
+    QueryResult result = WorldDatabase.Query(
+        "SELECT `ID`, `Description` FROM `coa_client_spell_description`");
+    if (!result)
+      return descriptions;
+
+    do {
+      Field const *fields = result->Fetch();
+      descriptions.emplace(fields[0].Get<uint32>(),
+                           fields[1].Get<std::string>());
+    } while (result->NextRow());
+
+    return descriptions;
+  }
+
+  static std::vector<ItemDisplayInfoPatchRow> LoadItemDisplayInfoPatchRows() {
+    std::vector<ItemDisplayInfoPatchRow> rows;
+    QueryResult result = WorldDatabase.Query(
+        "SELECT `ID`, `ModelName_1`, `ModelName_2`, `ModelTexture_1`, "
+        "`ModelTexture_2`, `InventoryIcon_1`, `InventoryIcon_2`, "
+        "`GeosetGroup_1`, `GeosetGroup_2`, `GeosetGroup_3`, `Flags`, "
+        "`SpellVisualID`, `GroupSoundIndex`, `HelmetGeosetVis_1`, "
+        "`HelmetGeosetVis_2`, `Texture_1`, `Texture_2`, `Texture_3`, "
+        "`Texture_4`, `Texture_5`, `Texture_6`, `Texture_7`, `Texture_8`, "
+        "`ItemVisual`, `ParticleColorID` FROM `itemdisplayinfo_dbc` "
+        "ORDER BY `ID`");
+    if (!result)
+      return rows;
+
+    do {
+      Field const *fields = result->Fetch();
+      ItemDisplayInfoPatchRow &row = rows.emplace_back();
+      std::size_t stringIndex = 0;
+      for (uint8 field = 0; field < ITEM_DISPLAY_INFO_FIELD_COUNT; ++field) {
+        if (IsItemDisplayInfoStringField(field))
+          row.Strings[stringIndex++] = fields[field].Get<std::string>();
+        else
+          row.Values[field] = static_cast<uint32>(fields[field].Get<int32>());
+      }
+    } while (result->NextRow());
+
+    return rows;
+  }
+
+  static std::vector<ItemPatchRow> LoadItemPatchRows() {
+    std::vector<ItemPatchRow> rows;
+    QueryResult result = WorldDatabase.Query(
+        "SELECT `ID`, `ClassID`, `SubclassID`, `Sound_Override_Subclassid`, "
+        "`Material`, `DisplayInfoID`, `InventoryType`, `SheatheType` "
+        "FROM `item_dbc` ORDER BY `ID`");
+    if (!result)
+      return rows;
+
+    do {
+      Field const *fields = result->Fetch();
+      ItemPatchRow &row = rows.emplace_back();
+      for (std::size_t field = 0; field < row.size(); ++field)
+        row[field] = static_cast<uint32>(fields[field].Get<int32>());
+    } while (result->NextRow());
+
+    return rows;
+  }
+
+  std::vector<uint32>
+  BuildDisplayPatchRows(std::filesystem::path const &clientDbcDirectory) const {
+    std::filesystem::path const clientDbc =
+        clientDbcDirectory / "CreatureDisplayInfo.dbc";
+    std::optional<std::unordered_set<uint32>> const clientDisplayIds =
+        LoadDbcIds(clientDbc, 16);
+    bool const haveClientSet = clientDisplayIds.has_value();
+    if (!haveClientSet)
+    {
+      LOG_WARN("coa",
+               "Client DBC copy {} is unavailable; streaming every display id "
+               "at or above {} instead of the exact missing set",
+               clientDbc.generic_string(), CUSTOM_DISPLAY_ID_FALLBACK_MIN);
+    }
+
+    std::vector<uint32> rows;
+    for (uint32 displayId = 0;
+         displayId < sCreatureDisplayInfoStore.GetNumRows(); ++displayId) {
+      if (!sCreatureDisplayInfoStore.LookupEntry(displayId))
+        continue;
+
+      if (haveClientSet)
+      {
+        if (clientDisplayIds->contains(displayId))
+          continue;
+      }
+      else if (displayId < CUSTOM_DISPLAY_ID_FALLBACK_MIN)
+      {
+        continue;
+      }
+
+      rows.push_back(displayId);
+    }
+
+    return rows;
+  }
+
+  std::mutex _mutex;
+  std::unordered_set<uint32> _streamedPlayers;
+  std::unordered_map<uint32, uint32> _fallbackTimers;
+
+  std::mutex _cacheMutex;
+  bool _rowsPrepared = false;
+  PreparedPatchRows _rows;
+};
+
 class AscensionCollectionService {
 public:
     static bool IsCosmeticCategory(uint32 category)
@@ -3156,6 +3669,8 @@ public:
     _vanityItems.clear();
     _allAppearanceIds.clear();
     _allVanityItemIds.clear();
+    _woodworkingAppearancePatches.clear();
+    _woodworkingItemAppearancePatches.clear();
 
     ClientDBC appearances;
     bool appearancesLoaded =
@@ -3180,13 +3695,17 @@ public:
     ClientDBC itemAppearances;
     bool itemAppearancesLoaded =
         itemAppearances.Load(GetClientDBCPath("ItemAppearances.dbc"), 3);
+    uint32 lastItemAppearanceRecordId = 0;
     for (uint32 row = 0; row < itemAppearances.GetRecordCount(); ++row) {
       ClientDBC::Record record = itemAppearances.GetRecord(row);
+      lastItemAppearanceRecordId = std::max(lastItemAppearanceRecordId, record.GetUInt32(0));
       uint32 itemId = record.GetUInt32(1);
       uint32 appearanceId = record.GetUInt32(2);
       if (itemId && appearanceId)
         _itemAppearances[itemId] = appearanceId;
     }
+    if (appearancesLoaded && itemAppearancesLoaded)
+        LoadWoodworkingAppearances(lastItemAppearanceRecordId);
 
     ClientDBC itemSets;
     bool itemSetsLoaded = itemSets.Load(GetClientDBCPath("ItemSet.dbc"), 35);
@@ -3288,6 +3807,8 @@ public:
       return;
     }
 
+    SendWoodworkingAppearanceCatalog(player);
+
     std::shared_ptr<PlayerCollectionState> state = TakeLoginState(player);
     if (!state)
       state = LoadCollectionState(player);
@@ -3388,6 +3909,23 @@ public:
             state->CosmeticTimer -= diff;
     }
   }
+
+    void OnCosmeticCancelled(Player* player, uint32 spellId)
+    {
+        auto state = GetState(player);
+        if (!state || !state->AppliedCosmeticSpells.contains(spellId))
+            return;
+
+        for (uint32 category = 56; category <= 58; ++category)
+        {
+            auto itr = _appearances.find(state->ActiveAppearances[category]);
+            if (itr != _appearances.end() && itr->second.CosmeticSpell == spellId)
+                state->ActiveAppearances[category] = 0;
+        }
+        state->AppliedCosmeticSpells.erase(spellId);
+        SaveActiveAppearances(player, *state);
+        SendActiveAppearances(player, *state);
+    }
 
     void ProcessCompanionLoot(Player* player, uint32 diff, bool skin = false)
     {
@@ -3633,6 +4171,46 @@ public:
     CollectItem(player, *state, item->GetEntry(), true);
   }
 
+    void OnQuestRewarded(Player* player, Quest const* quest)
+    {
+        if (!quest)
+            return;
+
+        auto state = GetState(player);
+        if (!state)
+            return;
+
+        for (uint32 index = 0; index < QUEST_REWARDS_COUNT; ++index)
+            if (quest->RewardItemId[index] && quest->RewardItemIdCount[index])
+                CollectItemAppearance(player, *state, quest->RewardItemId[index], true, true);
+
+        for (uint32 index = 0; index < QUEST_REWARD_CHOICES_COUNT; ++index)
+            if (quest->RewardChoiceItemId[index] && quest->RewardChoiceItemCount[index])
+                CollectItemAppearance(player, *state, quest->RewardChoiceItemId[index], true, true);
+    }
+
+    void OnLootRollStart(Roll const& roll, Loot const& loot, LootItem const& item)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item.itemid);
+        if (!proto || proto->Quality >= ITEM_QUALITY_EPIC)
+            return;
+
+        for (auto const& [guid, vote] : roll.playerVote)
+        {
+            if (vote == NOT_VALID)
+                continue;
+
+            Player* player = ObjectAccessor::FindConnectedPlayer(guid);
+            if (!player || !player->GetSession() || player->GetSession()->IsBot() ||
+                !item.AllowedForPlayer(player, loot.sourceWorldObjectGUID))
+                continue;
+
+            auto state = GetState(player);
+            if (state)
+                CollectItemAppearance(player, *state, item.itemid, true, true);
+        }
+    }
+
   void OnVisibleItemSet(Player *player, uint8 slot, Item *item) {
     if (!item)
       return;
@@ -3768,6 +4346,114 @@ public:
   }
 
 private:
+    void LoadWoodworkingAppearances(uint32 lastMappingId)
+    {
+        using VisualKey = std::tuple<uint32, uint32, uint32, uint32>;
+        auto const visualKey = [](ItemTemplate const& item)
+        {
+            return VisualKey{item.DisplayInfoID, item.Class, item.SubClass, item.InventoryType};
+        };
+        std::map<VisualKey, uint32> visualAppearances;
+        for (auto const& [id, appearance] : _appearances)
+        {
+            ItemTemplate const* item = sObjectMgr->GetItemTemplate(appearance.SourceItem);
+            if (!item || !IsEquipmentAppearance(appearance))
+                continue;
+            auto [mapping, inserted] = visualAppearances.try_emplace(visualKey(*item), id);
+            if (!inserted)
+                mapping->second = std::min(mapping->second, id);
+        }
+
+        std::set<uint32> craftedItems;
+        for (SkillLineAbilityEntry const* ability : GetSkillLineAbilitiesBySkillLine(SKILL_WOODWORKING))
+        {
+            SpellInfo const* spell = ability ? sSpellMgr->GetSpellInfo(ability->Spell) : nullptr;
+            if (!spell)
+                continue;
+            for (SpellEffectInfo const& effect : spell->Effects)
+                if (effect.Effect == SPELL_EFFECT_CREATE_ITEM || effect.Effect == SPELL_EFFECT_CREATE_ITEM_2)
+                    craftedItems.insert(effect.ItemType);
+        }
+
+        for (uint32 itemId : craftedItems)
+        {
+            ItemTemplate const* item = sObjectMgr->GetItemTemplate(itemId);
+            if (!item || _itemAppearances.contains(itemId) ||
+                (item->Class != ITEM_CLASS_WEAPON && item->Class != ITEM_CLASS_ARMOR))
+                continue;
+
+            uint32 primaryCategory = 0;
+            uint32 secondaryCategory = 0;
+            switch (item->InventoryType)
+            {
+                case INVTYPE_HEAD:
+                    primaryCategory = 1;
+                    break;
+                case INVTYPE_RANGED:
+                case INVTYPE_RANGEDRIGHT:
+                case INVTYPE_THROWN:
+                    primaryCategory = 12;
+                    break;
+                case INVTYPE_2HWEAPON:
+                case INVTYPE_WEAPON:
+                    primaryCategory = 13;
+                    secondaryCategory = 14;
+                    break;
+                case INVTYPE_SHIELD:
+                case INVTYPE_HOLDABLE:
+                    primaryCategory = 14;
+                    break;
+                default:
+                    continue;
+            }
+
+            if (lastMappingId == std::numeric_limits<uint32>::max())
+                break;
+
+            auto const key = visualKey(*item);
+            auto visual = visualAppearances.find(key);
+            uint32 appearanceId = 0;
+            if (visual != visualAppearances.end())
+                appearanceId = visual->second;
+            else
+            {
+                if (_appearances.contains(itemId))
+                {
+                    LOG_WARN("coa", "Woodworking item {} cannot use an existing unrelated appearance ID", itemId);
+                    continue;
+                }
+                appearanceId = itemId;
+                _appearances.emplace(appearanceId, AppearanceInfo{itemId, primaryCategory, secondaryCategory});
+                _allAppearanceIds.push_back(appearanceId);
+                visualAppearances.emplace(key, appearanceId);
+                _woodworkingAppearancePatches.push_back({appearanceId, itemId, 0, itemId, 0,
+                    primaryCategory, secondaryCategory, 0, itemId, 0, 0, 100, 1, 1, 1, 1, 1});
+            }
+
+            _itemAppearances.emplace(itemId, appearanceId);
+            _woodworkingItemAppearancePatches.push_back({++lastMappingId, itemId, appearanceId});
+        }
+    }
+
+    void SendWoodworkingAppearanceCatalog(Player* player)
+    {
+        for (auto const& row : _woodworkingAppearancePatches)
+        {
+            WorldPacket packet(SMSG_PATCH_APPEARANCES, 17 * sizeof(uint32) + sizeof("APPEARANCE_DISPLAY_TYPE_ITEM"));
+            for (uint32 field : row)
+                packet << field;
+            packet << "APPEARANCE_DISPLAY_TYPE_ITEM";
+            player->GetSession()->SendPacket(&packet);
+        }
+        for (auto const& row : _woodworkingItemAppearancePatches)
+        {
+            WorldPacket packet(SMSG_PATCH_ITEM_APPEARANCES, 3 * sizeof(uint32));
+            for (uint32 field : row)
+                packet << field;
+            player->GetSession()->SendPacket(&packet);
+        }
+    }
+
   void UnlockLocalAppearanceCatalog(Player *player,
                                     PlayerCollectionState &state) {
     if (!ascensionCompatConfig.GetConfigValue<bool>(
@@ -4033,27 +4719,36 @@ private:
     return false;
   }
 
-  void CollectItem(Player *player, PlayerCollectionState &state, uint32 itemId,
-                   bool notifyClient) {
-    auto mappingItr = _itemAppearances.find(itemId);
-    if (mappingItr != _itemAppearances.end())
+    void CollectItemAppearance(Player* player, PlayerCollectionState& state, uint32 itemId,
+        bool notifyClient, bool equipmentOnly = false)
     {
-      uint32 appearanceId = mappingItr->second;
-      auto const appearance = _appearances.find(appearanceId);
-      if (appearance != _appearances.end() && IsEquipmentAppearance(appearance->second))
-        sScriptMgr->OnPlayerCoAProgress(player, CoAProgressEvent::AppearanceCollected, appearanceId);
-      if (_appearances.contains(appearanceId) &&
-          state.CollectedAppearances.insert(appearanceId).second) {
+        auto const mapping = _itemAppearances.find(itemId);
+        if (mapping == _itemAppearances.end())
+            return;
+
+        uint32 const appearanceId = mapping->second;
+        auto const appearance = _appearances.find(appearanceId);
+        if (appearance == _appearances.end() || (equipmentOnly && !IsEquipmentAppearance(appearance->second)))
+            return;
+
+        if (IsEquipmentAppearance(appearance->second))
+            sScriptMgr->OnPlayerCoAProgress(player, CoAProgressEvent::AppearanceCollected, appearanceId);
+
+        if (!state.CollectedAppearances.insert(appearanceId).second)
+            return;
+
         CharacterDatabase.Execute(
             "INSERT IGNORE INTO `account_appearance_collection` (`account_id`, "
             "`appearance_id`, `source_item`) "
             "VALUES ({}, {}, {})",
             state.AccountId, appearanceId, itemId);
-
         if (notifyClient)
-          SendAppearanceAdded(player, appearanceId, itemId);
-      }
+            SendAppearanceAdded(player, appearanceId, itemId);
     }
+
+  void CollectItem(Player *player, PlayerCollectionState &state, uint32 itemId,
+                   bool notifyClient) {
+    CollectItemAppearance(player, state, itemId, notifyClient);
 
     if (_vanityItems.contains(itemId))
       sScriptMgr->OnPlayerCoAProgress(player, CoAProgressEvent::VanityCollected, itemId);
@@ -4119,6 +4814,7 @@ private:
         SendSecureAddonList(player->GetSession());
         player->SendAllSpellChargeStates();
         SendAscensionRunemasterEchoesCooldown(player);
+        AscensionDisplayPatchService::Instance().SendPatchStream(player);
         LOG_DEBUG("coa", "Resent spell charge state to {} after client world entry",
                   player->GetName());
         break;
@@ -4332,11 +5028,15 @@ public:
         AscensionCompatConfig::REALM_TYPE);
 
     uint8 flags[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    if (art == "seasonal")         flags[1] = 1;
-    else if (art == "league")      flags[2] = 1;
-    else if (art == "ptr")         flags[3] = 1;
-    else if (art == "development") flags[4] = 1;
-    else                           flags[0] = 1;
+    for (std::string_view type : Acore::Tokenize(art, ' ', false)) {
+      if (type == "live")             flags[0] = 1;
+      else if (type == "seasonal")    flags[1] = 1;
+      else if (type == "league")      flags[2] = 1;
+      else if (type == "ptr")         flags[3] = 1;
+      else if (type == "development") flags[4] = 1;
+    }
+    if (std::none_of(flags, flags + 5, [](uint8 flag) { return flag != 0; }))
+      flags[0] = 1;
 
     std::string const model = ascensionCompatConfig.GetConfigValue<std::string>(
         AscensionCompatConfig::CLASS_MODEL);
@@ -4345,9 +5045,13 @@ public:
     else if (model == "wcr")
       flags[REALM_CREATION_FLAG_WARCRAFT_REBORN] = 1;
 
+    uint32 const maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    uint32 const ruleset = maxLevel <= 60 ? EXPANSION_CLASSIC
+        : maxLevel <= 70 ? EXPANSION_THE_BURNING_CRUSADE : EXPANSION_WRATH_OF_THE_LICH_KING;
+
     WorldPacket p(SMSG_REALM_INFO, 64);
     p << static_cast<uint32>(realm.Id.Realm);
-    p << static_cast<uint32>(EXPANSION_WRATH_OF_THE_LICH_KING);
+    p << ruleset;
     p << 0.0f << 0.0f << 0.0f;
     p << static_cast<uint32>(0);
     p << 0.0f << 0.0f;
@@ -4361,8 +5065,8 @@ public:
     session->SendPacket(&p);
 
     LOG_INFO("coa",
-             "Realm info sent to {}: type {}, class model {}, realm {} ({}).",
-             who, art, model, realm.Id.Realm, realm.Name);
+             "Realm info sent to {}: type {}, class model {}, ruleset {}, realm {} ({}).",
+             who, art, model, ruleset, realm.Id.Realm, realm.Name);
   }
 
   void SendGameModeState(Player *player) {
@@ -4643,6 +5347,8 @@ private:
   std::unordered_map<uint32, VanityInfo> _vanityItems;
   std::vector<uint32> _allAppearanceIds;
   std::vector<uint32> _allVanityItemIds;
+    std::vector<std::array<uint32, 17>> _woodworkingAppearancePatches;
+    std::vector<std::array<uint32, 3>> _woodworkingItemAppearancePatches;
 
   std::mutex _packetMutex;
   std::unordered_map<uint32, std::deque<WorldPacket>> _pendingPackets;
@@ -4941,14 +5647,14 @@ public:
         {
             ObjectGuid guid = packet.read<ObjectGuid>(0);
             CreatureDisplayPreset const* preset = nullptr;
+            uint32 unitDisplayId = 0;
 
             if (guid.IsCreatureOrVehicle())
             {
-                uint32 displayId = 0;
                 if (Creature const* creature = session->GetPlayer()->GetMap()->GetCreature(guid))
-                    displayId = creature->GetDisplayId();
+                    unitDisplayId = creature->GetDisplayId();
 
-                preset = sAscensionPresets->GetPreset(guid.GetEntry(), displayId);
+                preset = sAscensionPresets->GetPreset(guid.GetEntry(), unitDisplayId);
             }
 
             if (!preset)
@@ -4960,7 +5666,7 @@ public:
             {
                 WorldPacket response(SMSG_MIRRORIMAGE_DATA, 68);
                 response << guid;
-                response << uint32(preset->display_id);
+                response << uint32(unitDisplayId != 0 ? unitDisplayId : preset->display_id);
                 response << uint8(preset->race);
                 response << uint8(preset->gender);
                 response << uint8(preset->class_id);
@@ -5426,6 +6132,7 @@ public:
             {PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_UPDATE,
              PLAYERHOOK_ON_AFTER_SET_VISIBLE_ITEM_SLOT, PLAYERHOOK_ON_EQUIP, PLAYERHOOK_ON_DELETE,
              PLAYERHOOK_ON_STORE_NEW_ITEM, PLAYERHOOK_ON_CREATE_ITEM,
+             PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST,
              PLAYERHOOK_ON_PLAYER_IS_CLASS, PLAYERHOOK_ON_LEVEL_CHANGED,
              PLAYERHOOK_ON_LEARN_SPELL, PLAYERHOOK_ON_FORGOT_SPELL,
              PLAYERHOOK_ON_AFTER_SPEC_SLOT_CHANGED,
@@ -5473,6 +6180,7 @@ public:
             AscensionCollectionService::Instance().PrepareOwnedCompanionsBeforeMap(player);
             AscensionCollectionService::Instance().PrepareOwnedBankSpellsBeforeMap(player);
             AscensionClassService::Instance().PrepareTaughtAbilitiesBeforeMap(player);
+            AscensionClassService::Instance().QueueCharacterAdvancementState(player);
         }
     }
 
@@ -5554,6 +6262,7 @@ public:
       SynchronizeAscensionClassMechanics(player);
       AscensionResourceService::Instance().OnPlayerLogin(player);
       AscensionCollectionService::Instance().OnPlayerLogin(player);
+      AscensionDisplayPatchService::Instance().OnPlayerLogin(player);
       RefreshScaledQuestQueries(player);
       SendAverageItemLevel(player);
     }
@@ -5645,6 +6354,7 @@ public:
     AscensionClassService::Instance().OnPlayerLogout(player);
     AscensionResourceService::Instance().OnPlayerLogout(player);
     AscensionCollectionService::Instance().OnPlayerLogout(player);
+    AscensionDisplayPatchService::Instance().OnPlayerLogout(player);
   }
 
   void OnPlayerUpdate(Player *player, uint32 diff) override {
@@ -5654,6 +6364,7 @@ public:
       AscensionClassService::Instance().UpdateClassTuning(player, diff);
       AscensionResourceService::Instance().OnPlayerUpdate(player, diff);
       AscensionCollectionService::Instance().OnPlayerUpdate(player, diff);
+      AscensionDisplayPatchService::Instance().OnPlayerUpdate(player, diff);
       EquipNewItems(player);
       if (sAscensionPresets->GetActivePresetOverride(player->GetGUID()))
       {
@@ -5674,6 +6385,12 @@ public:
                      bool) override {
     AscensionCollectionService::Instance().OnItemObtained(player, item);
   }
+
+    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
+    {
+        if (ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED))
+            AscensionCollectionService::Instance().OnQuestRewarded(player, quest);
+    }
 
   void OnPlayerStoreNewItem(Player *player, Item *item,
                             uint32) override {
@@ -5875,6 +6592,9 @@ public:
 
     HandleAscensionClassMechanicsAuraRemove(unit->ToPlayer(),
         aurApp->GetBase()->GetId(), mode == AURA_REMOVE_BY_DEATH);
+    if (mode == AURA_REMOVE_BY_CANCEL)
+      AscensionCollectionService::Instance().OnCosmeticCancelled(
+          unit->ToPlayer(), aurApp->GetBase()->GetId());
   }
 };
 
@@ -6058,6 +6778,7 @@ public:
         AscensionCompatConfig::LAST_EXTENSION_OPCODE);
     bool dataLoaded =
         AscensionCollectionService::Instance().LoadClientData();
+    AscensionDisplayPatchService::Instance().Initialize();
     AscensionResourceService::Instance().ValidateDefinitions();
     LOG_INFO("coa",
              "Ascension compatibility enabled; consuming extension opcodes "
@@ -6655,6 +7376,12 @@ void AddAscensionSpecializationSwitchGuard(AscensionSpecializationSwitchGuard gu
         SpecializationSwitchGuards().push_back(std::move(guard));
 }
 
+std::string AscensionSpecializationSwitchRefusal(Player* player, uint32 activeSpecializationId,
+    uint32 requestedSpecializationId)
+{
+    return SpecializationSwitchRefusal(player, activeSpecializationId, requestedSpecializationId);
+}
+
 uint32 ForgetAscensionClassTalents(Player* player)
 {
     if (!player || !IsAscensionCustomClass(player))
@@ -6781,6 +7508,19 @@ std::vector<AscensionClassAbility> GetAscensionClassAbilities(uint8 classId)
     return abilities;
 }
 
+class AscensionCompatGroupScript : public GroupScript
+{
+public:
+    AscensionCompatGroupScript()
+        : GroupScript("AscensionCompatGroupScript", {GROUPHOOK_ON_LOOT_ROLL_START}) { }
+
+    void OnLootRollStart(Group*, Roll const& roll, Loot const& loot, LootItem const& item) override
+    {
+        if (ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED))
+            AscensionCollectionService::Instance().OnLootRollStart(roll, loot, item);
+    }
+};
+
 class AscensionCompatAllCreatureScript : public AllCreatureScript {
 public:
   AscensionCompatAllCreatureScript()
@@ -6837,6 +7577,7 @@ void AddAscensionCompatScripts() {
   new AscensionCompatServerScript();
   new AscensionCompatCommandScript();
   new AscensionCompatPlayerScript();
+  new AscensionCompatGroupScript();
   new AscensionCompatAllSpellScript();
   new AscensionCompatUnitScript();
   new AscensionCompatChangelogScript();
