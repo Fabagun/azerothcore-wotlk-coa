@@ -13288,6 +13288,7 @@ void Unit::SetHealth(uint32 val)
             val = maxHealth;
     }
 
+    uint32 const previousHealth = GetHealth();
     float prevHealthPct = GetHealthPct();
 
     SetUInt32Value(UNIT_FIELD_HEALTH, val);
@@ -13323,6 +13324,8 @@ void Unit::SetHealth(uint32 val)
                 }
         }
     }
+    if (previousHealth != GetHealth())
+        sScriptMgr->OnHealthChanged(this);
 }
 
 void Unit::SetMaxHealth(uint32 val)
@@ -13330,6 +13333,7 @@ void Unit::SetMaxHealth(uint32 val)
     if (!val)
         val = 1;
 
+    uint32 const previousMaxHealth = GetMaxHealth();
     uint32 health = GetHealth();
     SetUInt32Value(UNIT_FIELD_MAXHEALTH, val);
 
@@ -13361,6 +13365,8 @@ void Unit::SetMaxHealth(uint32 val)
 
     if (val < health)
         SetHealth(val);
+    else if (previousMaxHealth != val)
+        sScriptMgr->OnHealthChanged(this);
 }
 
 void Unit::SetPower(Powers power, uint32 val, bool withPowerUpdate /*= true*/, bool fromRegenerate /* = false */)
@@ -16403,8 +16409,17 @@ void Unit::UpdateObjectVisibility(bool forced, bool /*fromUpdate*/)
     }
 }
 
+bool Unit::IsImmuneToForcedMovement() const
+{
+    Creature const* creature = ToCreature();
+    return creature && (creature->isWorldBoss() || creature->IsDungeonBoss() || creature->IsImmuneToKnockback());
+}
+
 void Unit::KnockbackFrom(float x, float y, float speedXY, float speedZ)
 {
+    if (IsImmuneToForcedMovement())
+        return;
+
     Player* player = ToPlayer();
     if (!player)
     {
