@@ -3462,7 +3462,8 @@ public:
 
   void OnPlayerLogin(Player *player) {
     if (!ascensionCompatConfig.GetConfigValue<bool>(
-            AscensionCompatConfig::SEND_DISPLAY_PATCHES))
+            AscensionCompatConfig::SEND_DISPLAY_PATCHES) ||
+        player->GetSession()->IsBot())
       return;
 
     uint32 const guid = player->GetGUID().GetCounter();
@@ -3492,7 +3493,8 @@ public:
 
   void OnPlayerUpdate(Player *player, uint32 diff) {
     if (!ascensionCompatConfig.GetConfigValue<bool>(
-            AscensionCompatConfig::SEND_DISPLAY_PATCHES))
+            AscensionCompatConfig::SEND_DISPLAY_PATCHES) ||
+        player->GetSession()->IsBot())
       return;
 
     uint32 const guid = player->GetGUID().GetCounter();
