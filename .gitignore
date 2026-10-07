@@ -149,5 +149,9 @@ __pycache__/
 !/modules/mod-coa-legendary-items/
 !/modules/mod-ale/
 !/modules/mod-playerbots/
+!/modules/mod-coa-raid-difficulty/
+!/modules/mod-dynamic-xp/
+!/modules/mod-ethereal-bazaar/
+!/modules/mod-worldforged-upgrades/
 
 /data/coa-world/coa-world-20260912/
