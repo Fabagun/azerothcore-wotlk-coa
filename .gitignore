@@ -147,3 +147,7 @@ __pycache__/
 !/modules/mod-woodworking/
 !/modules/mod-portable-sawmill/
 !/modules/mod-coa-legendary-items/
+!/modules/mod-ale/
+!/modules/mod-playerbots/
+
+/data/coa-world/coa-world-20260912/
