@@ -3,7 +3,7 @@
 	url = https://github.com/Fabagun/squidbots-dashboard
 [submodule "modules/mod-ale"]
 	path = modules/mod-ale
-	url = git@github.com:azerothcore/mod-ale.git
+	url = git@github.com:Fabagun/mod-ale.git
 [submodule "modules/mod-playerbots"]
 	path = modules/mod-playerbots
 	url = git@github.com:Fabagun/mod-playerbots.git
